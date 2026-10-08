@@ -25,5 +25,13 @@ module.exports = {
         android: null,
       },
     },
+    // Only used by the iOS download bridge (js/lib/handleDownload.js): Android
+    // downloads go through the system DownloadManager. Its Android native module
+    // is not linked, so the JS must never require it on Android either.
+    'react-native-blob-util': {
+      platforms: {
+        android: null,
+      },
+    },
   },
 };

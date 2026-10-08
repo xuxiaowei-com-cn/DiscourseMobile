@@ -2,8 +2,21 @@
 'use strict';
 
 import { Alert, Platform, Share } from 'react-native';
-import ReactNativeBlobUtil from 'react-native-blob-util';
 import i18n from 'i18n-js';
+
+// react-native-blob-util is an iOS-only dependency (see react-native.config.js)
+// and its entry point reads `NativeModules.RNBlobUtils.getConstants()` while
+// being imported. Importing it at module scope therefore blew up on Android with
+// "Cannot read property 'getConstants' of null" - and because this module is
+// loaded during startup, release builds treated that as a fatal error and
+// aborted the process. Only load it on iOS, where the bridge download is used.
+// Metro compiles the package to ESM with a `default` export, Jest mocks it as a
+// plain CommonJS object, so both shapes are supported.
+const blobUtilModule =
+  Platform.OS === 'ios' ? require('react-native-blob-util') : null;
+const ReactNativeBlobUtil = blobUtilModule
+  ? blobUtilModule.default ?? blobUtilModule
+  : null;
 
 export const MAX_BRIDGED_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 

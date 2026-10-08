@@ -72,6 +72,18 @@ def enableProguardInReleaseBuilds = false
  */
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
 
+/**
+ * Build for devices without Google Play Services (GMS).
+ *
+ * FCM push cannot work without GMS, and Firebase creates its default app from a
+ * startup ContentProvider (com.google.firebase.provider.FirebaseInitProvider)
+ * before any JS runs - if that throws, the process dies before the app can
+ * render, which cannot be caught from JavaScript. Building with -PnoGms
+ * disables that provider so the app starts and simply runs without push.
+ */
+def noGms = project.hasProperty("noGms")
+def firebaseInitProviderEnabled = noGms ? "false" : "true"
+
 
 android {
     namespace 'com.discourse'
@@ -102,11 +114,17 @@ android {
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
             signingConfig signingConfigs.release
-            manifestPlaceholders = [permissionName: "android.permission.SYSTEM_ALERT_WINDOW"]
+            manifestPlaceholders = [
+                permissionName: "android.permission.SYSTEM_ALERT_WINDOW",
+                firebaseInitProviderEnabled: firebaseInitProviderEnabled
+            ]
 
         }
         debug {
-            manifestPlaceholders = [permissionName: "MADE.UP.To.Make.SYSTEM_ALERT_WINDOW.removal.work"]
+            manifestPlaceholders = [
+                permissionName: "MADE.UP.To.Make.SYSTEM_ALERT_WINDOW.removal.work",
+                firebaseInitProviderEnabled: firebaseInitProviderEnabled
+            ]
         }
     }
 }
