@@ -1,0 +1,194 @@
+name: android
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: "ABIs to build, comma separated"
+        type: string
+        default: arm64-v8a
+      no_gms:
+        description: "Skip Firebase startup initialisation (devices without Google Play Services)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: android-${{ format('{0}-{1}', github.head_ref || github.run_number, github.job) }}
+  cancel-in-progress: true
+
+env:
+  MYAPP_VERSION: 1.0.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # `.yarn/cache` is gitignored, so a fresh checkout downloads every package.
+      - name: Cache Yarn packages
+        uses: actions/cache@v4
+        with:
+          path: .yarn/cache
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-
+
+      - name: Install Yarn dependencies
+        run: node .yarn/releases/yarn-4.9.4.cjs install --immutable
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
+          yes | sdkmanager --licenses > /dev/null || true
+
+      # Signing must be prepared before gradle.properties is written, because the
+      # keystore path and passwords are referenced there. Repository secrets are
+      # used when configured (that is the Google Play key); otherwise a throwaway
+      # keystore keeps fork and pull request builds installable - such an APK can
+      # never be uploaded to Google Play.
+      - name: Prepare release signing keystore
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+            ALIAS="${KEY_ALIAS:-my-key-alias}"
+            STORE_PASSWORD="$KEYSTORE_PASSWORD"
+            KEY_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+            echo "Using keystore from repository secrets (alias: $ALIAS)"
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret, generating a throwaway keystore"
+            STORE_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+            ALIAS="ci-release"
+            KEY_PASS="$STORE_PASSWORD"
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE" -storetype PKCS12 \
+              -storepass "$STORE_PASSWORD" -keypass "$STORE_PASSWORD" \
+              -alias "$ALIAS" -keyalg RSA -keysize 4096 -validity 10000 \
+              -dname "CN=Discourse Mobile CI, O=Discourse, C=US"
+          fi
+          {
+            echo "keystore=$KEYSTORE"
+            echo "alias=$ALIAS"
+            echo "store_password=$STORE_PASSWORD"
+            echo "key_password=$KEY_PASS"
+          } >> "$GITHUB_OUTPUT"
+
+      # `android/gradle.properties` is gitignored (fastlane generates it from CI
+      # secrets), so a fresh checkout has no MYAPP_VERSION and no signing config:
+      # Gradle cannot even configure the project without it.
+      - name: Write android/gradle.properties
+        env:
+          STORE_FILE: ${{ steps.signing.outputs.keystore }}
+          STORE_PASSWORD: ${{ steps.signing.outputs.store_password }}
+          KEY_ALIAS: ${{ steps.signing.outputs.alias }}
+          KEY_PASSWORD: ${{ steps.signing.outputs.key_password }}
+        run: |
+          cat > android/gradle.properties <<EOF
+          MYAPP_VERSION=$MYAPP_VERSION
+          MYAPP_RELEASE_STORE_FILE=$STORE_FILE
+          MYAPP_RELEASE_STORE_PASSWORD=$STORE_PASSWORD
+          MYAPP_RELEASE_KEY_ALIAS=$KEY_ALIAS
+          MYAPP_RELEASE_KEY_PASSWORD=$KEY_PASSWORD
+
+          hermesEnabled=true
+          newArchEnabled=true
+          android.useAndroidX=true
+          android.enableJetifier=true
+
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          EOF
+
+      # Also gitignored. The real Firebase config is used when the secret exists,
+      # otherwise a placeholder keeps the build working (push is then unavailable,
+      # the app reports and ignores that at runtime).
+      - name: Write android/app/google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          else
+            echo "No GOOGLE_SERVICES_JSON secret, writing a placeholder config"
+            cat > android/app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "discourse-mobile"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.discourse"
+                  }
+                },
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDummyKeyForBuildPurposesOnly"
+                  }
+                ]
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+          fi
+
+      - name: Build release APK
+        run: |
+          ARGS="-PreactNativeArchitectures=${{ inputs.architectures || 'arm64-v8a' }}"
+          if [ "${{ inputs.no_gms }}" = "true" ]; then
+            ARGS="$ARGS -PnoGms"
+          fi
+          cd android
+          ./gradlew assembleRelease $ARGS
+
+      - name: Collect APK
+        run: |
+          SUFFIX=""
+          if [ "${{ inputs.no_gms }}" = "true" ]; then
+            SUFFIX="-nogms"
+          fi
+          mkdir -p artifacts
+          cp android/app/build/outputs/apk/release/app-release.apk \
+            "artifacts/discourse-$MYAPP_VERSION-release$SUFFIX.apk"
+          ls -la artifacts
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: discourse-android-release
+          path: artifacts/*.apk
+          if-no-files-found: error
