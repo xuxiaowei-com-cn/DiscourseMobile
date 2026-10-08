@@ -130,16 +130,24 @@ class Discourse extends React.Component {
       });
     }
 
-    if (Platform.OS === 'android') {
+    // Push requires Google Play Services (FCM). When Firebase is unavailable
+    // (device without GMS, or a -PnoGms build) firebaseMessaging is null and the
+    // app keeps working without push instead of failing to start.
+    if (Platform.OS === 'android' && firebaseMessaging) {
       PermissionsAndroid.request(
         PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
       );
 
-      firebaseMessaging.getToken().then(fcmToken => {
-        if (fcmToken) {
-          this._siteManager.registerClientId(fcmToken);
-        }
-      });
+      firebaseMessaging
+        .getToken()
+        .then(fcmToken => {
+          if (fcmToken) {
+            this._siteManager.registerClientId(fcmToken);
+          }
+        })
+        .catch(e => {
+          console.warn('[push] unable to get FCM token:', e?.message ?? e);
+        });
 
       this.onTokenRefreshListener = firebaseMessaging.onTokenRefresh(
         fcmToken => {
